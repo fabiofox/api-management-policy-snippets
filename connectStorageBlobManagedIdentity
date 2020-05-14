@@ -1,0 +1,133 @@
+<!--
+    IMPORTANT:
+    - Policy elements can appear only within the <inbound>, <outbound>, <backend> section elements.
+    - To apply a policy to the incoming request (before it is forwarded to the backend service), place a corresponding policy element within the <inbound> section element.
+    - To apply a policy to the outgoing response (before it is sent back to the caller), place a corresponding policy element within the <outbound> section element.
+    - To add a policy, place the cursor at the desired insertion point and select a policy from the sidebar.
+    - To remove a policy, delete the corresponding policy statement from the policy document.
+    - Position the <base> element within a section element to inherit all policies from the corresponding section element in the enclosing scope.
+    - Remove the <base> element to prevent inheriting policies from the corresponding section element in the enclosing scope.
+    - Policies are applied in the order of their appearance, from the top down.
+    - Comments within policy elements are not supported and may disappear. Place your comments between policy elements or at a higher level scope.
+-->
+<policies>
+    <inbound>
+        <base />
+        <!-- Get named values -->
+        <!-- https://storageaccount.blob.core.windows.net/container/. -->
+        <set-variable name="storageaccount" value="{{storageaccount}}" />
+        <set-variable name="container" value="{{container}}" />
+        <set-variable name="APIversion" value="{{APIversion}}" />
+        <set-variable name="blobType" value="{{blobType}}" />
+        <set-variable name="busQueueName" value="{{busQueueName}}" />
+        <set-variable name="sbAccount" value="{{sbAccount}}" />
+        <!-- Get inferred values -->
+        <set-variable name="FnODataAreaId" value="@{
+            return context.Request.OriginalUrl.Query.GetValueOrDefault("CompanyId"); 
+            }" />
+        <set-variable name="sunInterfaceType" value="@{
+            return context.Request.OriginalUrl.Query.GetValueOrDefault("InterfaceType"); 
+            }" />
+        <set-variable name="origFileName" value="@{
+            return context.Request.OriginalUrl.Query.GetValueOrDefault("DocumentName"); 
+            }" />
+        <set-variable name="uniqueBlobName" value="@{
+            return context.RequestId;
+            }" />
+        <set-variable name="requestBody" value="@{
+                return context.Request.Body.As<byte[]>(preserveContent: true);
+            }" />
+        <!-- Inspect original lenght by Header -->
+        <set-variable name="bodySize" value="@(context.Request.Headers["Content-Length"][0])" />
+        <choose>
+            <!-- if less then 256KB Service Bus can handle it (in devMode) dedicated sku can be 1MB -->
+            <when condition="@(int.Parse(context.Variables.GetValueOrDefault<string>("bodySize"))<256000)">
+                <!-- Route to Azure Service Bus -->
+                <send-request mode="new" response-variable-name="SBresponse" timeout="20" ignore-error="false">
+                    <set-url>@{
+                    var account    = (string)context.Variables["sbAccount"];
+                    var queue  = (string)context.Variables["busQueueName"];
+                    return $"https://{account}.servicebus.windows.net/{queue}/messages";
+                    }</set-url>
+                    <set-method>POST</set-method>
+                    <set-body>@{
+                            var bytes = (byte[])context.Variables["requestBody"];
+                            return bytes;
+                        }</set-body>
+                    <authentication-managed-identity resource="https://servicebus.azure.net" ignore-error="false" />
+                </send-request>
+                <return-response response-variable-name="SBresponse" />
+            </when>
+            <otherwise>
+                <!-- Put the original document in blob storage -->
+                <send-request mode="new" response-variable-name="createBlobResponse" timeout="20" ignore-error="false">
+                    <set-url>@{
+                    var account    = (string)context.Variables["storageaccount"];
+                    var container  = (string)context.Variables["container"];
+                    var uniqueGUID = context.Variables["uniqueBlobName"];
+                    var resourcePath = String.Format("{0}/{1}",container,uniqueGUID);
+                    return $"https://{account}.blob.core.windows.net/{resourcePath}";
+                    }</set-url>
+                    <set-method>PUT</set-method>
+                    <set-header name="x-ms-version" exists-action="override">
+                        <value>@((string)context.Variables["APIversion"])</value>
+                    </set-header>
+                    <set-header name="x-ms-blob-type" exists-action="override">
+                        <value>@((string)context.Variables["blobType"])</value>
+                    </set-header>
+                    <set-header name="x-ms-type" exists-action="override">
+                        <value>binary</value>
+                    </set-header>
+                    <set-body>@{
+                        var bytes = (byte[])context.Variables["requestBody"];
+                        return bytes;
+                    }</set-body>
+                    <!-- Using Identity manager which uses Oauth2 authentication  -->
+                    <authentication-managed-identity resource="https://storage.azure.com/" />
+                </send-request>
+                <choose>
+                    <when condition="@(((IResponse)context.Variables["createBlobResponse"]).StatusCode == 201)">
+                        <!-- Setting up metadata for companyId, InterfaceType, Filename -->
+                        <send-request mode="new" response-variable-name="metadataUpdResponse" timeout="20" ignore-error="false">
+                            <set-url>@{
+                        var account    = (string)context.Variables["storageaccount"];
+                        var container  = (string)context.Variables["container"];
+                        var uniqueGUID = context.Variables["uniqueBlobName"];
+                        var resourcePath = String.Format("{0}/{1}",container,uniqueGUID);
+                        return $"https://{account}.blob.core.windows.net/{resourcePath}?comp=metadata";
+                        }</set-url>
+                            <set-method>PUT</set-method>
+                            <set-header name="x-ms-version" exists-action="override">
+                                <value>@((string)context.Variables["APIversion"])</value>
+                            </set-header>
+                            <set-header name="x-ms-meta-fileName" exists-action="override">
+                                <value>@((string)context.Variables["origFileName"])</value>
+                            </set-header>
+                            <set-header name="x-ms-meta-company" exists-action="override">
+                                <value>@((string)context.Variables["FnODataAreaId"])</value>
+                            </set-header>
+                            <set-header name="x-ms-meta-intType" exists-action="override">
+                                <value>@((string)context.Variables["sunInterfaceType"])</value>
+                            </set-header>
+                            <set-body />
+                            <authentication-managed-identity resource="https://storage.azure.com/" />
+                        </send-request>
+                    </when>
+                    <otherwise>
+                        <return-response response-variable-name="createBlobResponse" />
+                    </otherwise>
+                </choose>
+                <return-response response-variable-name="createBlobResponse" />
+            </otherwise>
+        </choose>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
